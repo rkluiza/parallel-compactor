@@ -183,12 +183,56 @@ static void imprimir_stats(const Stats *st){
   printf("compressao ............ %.1f%%\n", pct);
 }
 
-static void compress(FILE *in, FILE *out, Stats *st){
+// Tudo que as três threads compartilham
+typedef struct {
+  FILE *in, *out;
+  Stats *st;
+  Buffer buf1;                   // leitora -> compactadora (Token)
+  Buffer buf2;                   // compactadora -> gravadora (Saida)
+} Contexto;
+
+static void *thread_leitora(void *arg){
+  Contexto *ctx = arg;
+  Token t;
+  while (ler_token(ctx->in, &t, ctx->st)) buffer_put(&ctx->buf1, &t);
+  buffer_close(&ctx->buf1);                 // fim do arquivo: avisa a compactadora
+  return NULL;
+}
+
+static void *thread_compactadora(void *arg){
+  Contexto *ctx = arg;
   Token t; Saida s;
-  while (ler_token(in, &t, st)){
-    compactar_token(&t, &s, st);
-    gravar_saida(out, &s, st);
+  while (buffer_get(&ctx->buf1, &t)){
+    compactar_token(&t, &s, ctx->st);
+    buffer_put(&ctx->buf2, &s);
   }
+  buffer_close(&ctx->buf2);                 // repassa o fim: avisa a gravadora
+  return NULL;
+}
+
+static void *thread_gravadora(void *arg){
+  Contexto *ctx = arg;
+  Saida s;
+  while (buffer_get(&ctx->buf2, &s)) gravar_saida(ctx->out, &s, ctx->st);
+  return NULL;
+}
+
+static void compress(FILE *in, FILE *out, Stats *st){
+  Contexto ctx = { .in = in, .out = out, .st = st };
+  buffer_init(&ctx.buf1, 8, sizeof(Token));
+  buffer_init(&ctx.buf2, 8, sizeof(Saida));
+
+  pthread_t tl, tc, tg;
+  pthread_create(&tl, NULL, thread_leitora,      &ctx);
+  pthread_create(&tc, NULL, thread_compactadora, &ctx);
+  pthread_create(&tg, NULL, thread_gravadora,    &ctx);
+
+  pthread_join(tl, NULL);
+  pthread_join(tc, NULL);
+  pthread_join(tg, NULL);
+
+  buffer_destroy(&ctx.buf1);
+  buffer_destroy(&ctx.buf2);
 }
 
 static void decompress(FILE *in, FILE *out){
