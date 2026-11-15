@@ -1,5 +1,5 @@
 /*
-gcc mini_zip.c -o mz
+gcc -pthread mini_zip.c -o mz
 ./mz -c entrada.txt compactado.mzp     # compactar
 ./mz -d compactado.mzp saida.txt       # descompactar
 */
