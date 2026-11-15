@@ -6,6 +6,8 @@ gcc mini_zip.c -o mz
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdlib.h>
+#include <pthread.h>
 
 #define BASE 0x80   // primeiro código de palavra
 #define MARK_CAP 0xFF   // "próxima palavra começa com maiúscula"
@@ -40,6 +42,71 @@ typedef struct {                 // o que a COMPACTADORA produz
   unsigned char dados[MAX_WORD + 2];
   int n;                         // quantos bytes são válidos
 } Saida;
+
+typedef struct {
+  unsigned char *dados;      // área: capacidade * tam_item bytes
+  size_t tam_item;           // tamanho de cada item
+  int capacidade;            // quantos itens cabem
+  int ini;                   // posição do próximo item a retirar
+  int fim;                   // posição onde o próximo item será inserido
+  int qtd;                   // quantos itens há agora
+  int fechado;               // 1 = o produtor terminou
+  pthread_mutex_t mutex;
+  pthread_cond_t  nao_cheio;
+  pthread_cond_t  nao_vazio;
+} Buffer;
+
+static int buffer_init(Buffer *b, int capacidade, size_t tam_item){
+  b->dados = malloc((size_t)capacidade * tam_item);
+  if (!b->dados) return -1;
+  b->tam_item = tam_item; b->capacidade = capacidade;
+  b->ini = b->fim = b->qtd = b->fechado = 0;
+  pthread_mutex_init(&b->mutex, NULL);
+  pthread_cond_init(&b->nao_cheio, NULL);
+  pthread_cond_init(&b->nao_vazio, NULL);
+  return 0;
+}
+
+static void buffer_destroy(Buffer *b){
+  pthread_mutex_destroy(&b->mutex);
+  pthread_cond_destroy(&b->nao_cheio);
+  pthread_cond_destroy(&b->nao_vazio);
+  free(b->dados);
+}
+
+// Produtor: coloca um item. Espera se estiver cheio.
+static void buffer_put(Buffer *b, const void *item){
+  pthread_mutex_lock(&b->mutex);
+  while (b->qtd == b->capacidade)
+    pthread_cond_wait(&b->nao_cheio, &b->mutex);
+  memcpy(b->dados + (size_t)b->fim * b->tam_item, item, b->tam_item);
+  b->fim = (b->fim + 1) % b->capacidade;
+  b->qtd++;
+  pthread_cond_signal(&b->nao_vazio);
+  pthread_mutex_unlock(&b->mutex);
+}
+
+// Consumidor: retira um item. Devolve 0 se acabou (fechado e vazio).
+static int buffer_get(Buffer *b, void *item){
+  pthread_mutex_lock(&b->mutex);
+  while (b->qtd == 0 && !b->fechado)
+    pthread_cond_wait(&b->nao_vazio, &b->mutex);
+  if (b->qtd == 0){ pthread_mutex_unlock(&b->mutex); return 0; }
+  memcpy(item, b->dados + (size_t)b->ini * b->tam_item, b->tam_item);
+  b->ini = (b->ini + 1) % b->capacidade;
+  b->qtd--;
+  pthread_cond_signal(&b->nao_cheio);
+  pthread_mutex_unlock(&b->mutex);
+  return 1;
+}
+
+// Produtor avisa que não vai mais inserir nada.
+static void buffer_close(Buffer *b){
+  pthread_mutex_lock(&b->mutex);
+  b->fechado = 1;
+  pthread_cond_broadcast(&b->nao_vazio);   // acorda consumidor que esteja esperando
+  pthread_mutex_unlock(&b->mutex);
+}
 
 static int word_to_code(const char *w){          
   for (int i = 0; i < N; i++)
