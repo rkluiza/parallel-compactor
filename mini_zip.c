@@ -17,18 +17,42 @@ gcc -pthread mini_zip.c -o mz
 
 #define BASE 0x80   // primeiro código de palavra
 #define MARK_CAP 0xFF   // "próxima palavra começa com maiúscula"
+#define PREFIXO_LONGO 0xFE  // avisa: o PRÓXIMO byte completa um código de 2 bytes
+#define LIMITE_1B (PREFIXO_LONGO - BASE)  // 126 = quantas palavras cabem em 1 byte
+#define MAX_PALAVRAS (LIMITE_1B + 256)  // 126 de 1 byte + 256 de 2 bytes = 382
 #define MAX_WORD 256
 
-static const char* WORD[] =
-  {"de","que","para","com","nao","por","em","uma","quando","muito","o","as",
-   "ao","mais","como","se","e","foi","tem","tambem","programa","processos","threads","arquivo",
-   "arquivos","texto","dicionario","palavras","compressao","exemplo","objetivo","leitura",
-   "gravar","relatorio","entrada","saida","aluno","testes","atividade"};
+// Dicionário ampliado, ordenado por frequência nos textos de teste
+// índices 0..125  -> código de 1 byte  (BASE + índice)
+// índices 126..   -> código de 2 bytes (PREFIXO_LONGO, índice - LIMITE_1B)
+static const char* WORD[] = {
+  // ---- 1 byte (126 palavras) ----
+  "e","o","de","compressao","programa","dicionario","do","texto","a","para",
+  "com","arquivos","em","palavras","arquivo","quando","que","um","exemplo","como",
+  "este","muitas","apenas","assim","foi","nao","palavra","threads","uma","vezes",
+  "ainda","aparecem","cada","curtas","da","diferentes","escolhemos","final","frases","grava",
+  "mesmo","mostra","muito","no","ocorrencias","original","os","ou","pequeno","pode",
+  "por","processo","processos","repeticoes","se","simbolo","simples","util","varias","academicos",
+  "ajuda","aluno","ao","aprendizado","aqui","as","ate","atividade","avaliar","bastante",
+  "c","caso","combinacoes","compactacao","comprimir","comprova","comum","comuns","concluir","contem",
+  "conter","contextos","continua","correspondente","criado","criados","demonstra","descompactado","deve","diferenca",
+  "direto","duas","efeito","eficiente","ele","encontra","encontre","entender","escrever","espacos",
+  "estatisticas","estimular","estruturas","exatamente","exibe","facil","falamos","fato","faz","fica",
+  "filho","foco","foque","formato","frequentes","ganhar","ganhos","gravar","ideia","igual",
+  "inclui","isso","juntos","leitura","ler","linha",
+  // ---- 2 bytes (55 palavras) ----
+  "linhas","logica","longo","maiores","mais","mas","material","maxima","menor","metodo",
+  "modo","mostrar","muitos","normal","objetivo","observar","organizado","pai","paragrafos","pensamos",
+  "pontuacao","porque","portugues","possivel","possui","preparado","preservar","reduz","relatorio","repete",
+  "repetem","repetidas","saida","seja","sejam","semelhantes","ser","sobre","solucao","tamanho",
+  "tambem","tantas","taxa","tecnicos","tem","termos","testes","textos","trabalha","trabalham",
+  "trabalhar","uso","utiliza","varios","ver"
+};
 
 static const int N = sizeof(WORD)/sizeof(WORD[0]);
 
- // 0x80..0xFE = 127 códigos (0xFF é o marcador)
-_Static_assert(sizeof(WORD)/sizeof(WORD[0]) <= 127, "dicionario grande demais para 1 byte");
+// 126 códigos de 1 byte + 256 de 2 bytes = 382 palavras no máximo
+_Static_assert(sizeof(WORD)/sizeof(WORD[0]) <= MAX_PALAVRAS, "dicionario grande demais");
 
 typedef struct {                 // só números: depois vai para memória compartilhada
   long palavras_lidas;
@@ -127,15 +151,31 @@ static void buffer_close(Buffer *b){
   pthread_mutex_unlock(&b->mutex);
 }
 
-static int word_to_code(const char *w){          
-  for (int i = 0; i < N; i++)
-    if (!strcmp(WORD[i], w)) return BASE + i;
+// Devolve o índice da palavra no dicionário (ou -1 se não existir)
+// O índice ainda não é o código: quem converte em bytes é gravar_codigo()
+static int word_to_index(const char *w) {
+  for (int i = 0; i < N; i++) {
+    if (!strcmp(WORD[i], w)) return i;
+  }
   return -1;
 }
 
-static const char* code_to_word(int c){             
-  if (c >= BASE && c < BASE + N) return WORD[c - BASE];
+// Devolve a palavra de um índice (ou NULL se o índice for inválido)
+static const char* index_to_word(int idx) {
+  if (idx >= 0 && idx < N) return WORD[idx];
   return NULL;
+}
+
+// Escreve em 'dst' o código do índice: 1 byte (índices 0..125) ou 2 bytes
+// (PREFIXO_LONGO + índice - LIMITE_1B). Devolve quantos bytes escreveu.
+static int gravar_codigo(unsigned char *dst, int idx) {
+  if (idx < LIMITE_1B) {
+    dst[0] = (unsigned char)(BASE + idx);
+    return 1;
+  }
+  dst[0] = PREFIXO_LONGO;
+  dst[1] = (unsigned char)(idx - LIMITE_1B);
+  return 2;
 }
 
 static void compactar_token(const Token *t, Saida *s, Shm *sh){
@@ -147,17 +187,21 @@ static void compactar_token(const Token *t, Saida *s, Shm *sh){
   size_t len = strlen(w);
   for (size_t i = 0; i <= len; i++) lw[i] = (char)tolower((unsigned char)w[i]);
 
-  int code = word_to_code(lw);
-  if (code < 0) stats_add(sh, &sh->st.palavras_nao_encontradas, 1);
+  int idx = word_to_index(lw);
+  if (idx < 0) stats_add(sh, &sh->st.palavras_nao_encontradas, 1);
   else if (strcmp(w, lw) == 0){                       // toda minúscula
-    s->dados[s->n++] = (unsigned char)code;
+    s->n += gravar_codigo(s->dados + s->n, idx);
     stats_add(sh, &sh->st.palavras_compactadas, 1);
     return;
-  } else if (len > 1 && isupper((unsigned char)w[0]) && strcmp(w+1, lw+1) == 0){
+  } else if (isupper((unsigned char)w[0]) && strcmp(w+1, lw+1) == 0) {
     s->dados[s->n++] = MARK_CAP;                      // 1ª letra maiúscula
-    s->dados[s->n++] = (unsigned char)code;
+    s->n += gravar_codigo(s->dados + s->n, idx);       // vale também para 1 letra, ex.: "O"
     stats_add(sh, &sh->st.palavras_compactadas, 1);
     return;
+  } else {
+    // está no dicionário, mas com maiúsculas que não sabemos representar
+    // (ex.: "DE"): vai como está e conta como não compactada
+    stats_add(sh, &sh->st.palavras_nao_encontradas, 1);
   }
   memcpy(s->dados, w, len);                           // grava a palavra como está
   s->n = (int)len;
@@ -243,6 +287,20 @@ static void compress(FILE *in, FILE *out, Shm *sh){
   buffer_destroy(&ctx.buf2);
 }
 
+// Lê um código de palavra cujo 1º byte 'c' já foi lido e devolve o ÍNDICE no dicionário
+// Se 'c' for o prefixo longo, lê (e conta) o 2º byte
+// Devolve -1 se 'c' não é código ou se o arquivo terminou no meio do código
+static int ler_indice(FILE *in, int c, Shm *sh) {
+  if (c < BASE || c == MARK_CAP) return -1;
+  if (c == PREFIXO_LONGO) {
+    int d = fgetc(in);            // 2º byte: é só um número, não interpretar
+    if (d == EOF) return -1;      // arquivo truncado
+    stats_add(sh, &sh->st.bytes_compactados, 1);
+    return LIMITE_1B + d;
+  }
+  return c - BASE;
+}
+
 static void decompress(FILE *in, FILE *out, Shm *sh){
   int c;
   while ((c = fgetc(in)) != EOF){
@@ -251,7 +309,9 @@ static void decompress(FILE *in, FILE *out, Shm *sh){
       int d = fgetc(in);
       if (d == EOF) break;                    // arquivo truncado
       stats_add(sh, &sh->st.bytes_compactados, 1);
-      const char *w = code_to_word(d);
+      int idx = ler_indice(in, d, sh);
+      if (idx < 0) break;                     // truncado ou inválido
+      const char *w = index_to_word(idx);
       if (w){
         fputc(toupper((unsigned char)w[0]), out);
         fputs(w + 1, out);
@@ -260,12 +320,16 @@ static void decompress(FILE *in, FILE *out, Shm *sh){
       }
       continue;
     }
-    const char *w = code_to_word(c);
-    if (w){
-      fputs(w, out);
-      stats_add(sh, &sh->st.palavras_compactadas, 1);
-      stats_add(sh, &sh->st.bytes_originais, (long)strlen(w));
-    } else {
+    if (c >= BASE) {                          // código de palavra (1 ou 2 bytes)
+      int idx = ler_indice(in, c, sh);
+      if (idx < 0) break;                     // truncado
+      const char *w = index_to_word(idx);
+      if (w) {
+        fputs(w, out);
+        stats_add(sh, &sh->st.palavras_compactadas, 1);
+        stats_add(sh, &sh->st.bytes_originais, (long)strlen(w));
+      }
+    } else {                                  // caractere normal: copia
       fputc(c, out);
       stats_add(sh, &sh->st.bytes_originais, 1);
     }
