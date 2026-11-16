@@ -3,6 +3,14 @@ gcc -pthread mini_zip.c -o mz
 ./mz -c entrada.txt compactado.mzp     # compactar
 ./mz -d compactado.mzp saida.txt       # descompactar
 */
+
+/*
+testar no modo detalhado:
+./mz -v -s 5 -c entrada2.txt entrada2.mzp > log.txt
+less log.txt
+
+*/
+
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
@@ -14,6 +22,28 @@ gcc -pthread mini_zip.c -o mz
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/syscall.h>
+#include <stdarg.h>
+
+// ---------- Modo demonstração ----------
+static int verbose   = 0;    // -v: cada thread conta o que está fazendo
+static int atraso_us = 0;    // -s ms: pausa artificial por item (só para a demo)
+static struct timespec t0;   // instante em que o programa começou
+
+// Imprime "[tempo] [PID x | TID y] PAPEL mensagem" (só no modo -v)
+static void logv(const char *papel, const char *fmt, ...){
+  if (!verbose) return;
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  double ms = (t.tv_sec - t0.tv_sec) * 1000.0 + (t.tv_nsec - t0.tv_nsec) / 1e6;
+  char msg[512];
+  va_list ap; va_start(ap, fmt); vsnprintf(msg, sizeof msg, fmt, ap); va_end(ap);
+  // um único printf por linha: as linhas das threads não se misturam
+  printf("[%8.2f ms] [PID %d | TID %ld] %-13s %s\n",
+         ms, (int)getpid(), (long)syscall(SYS_gettid), papel, msg);
+}
+
+static void pausa_demo(void){ if (atraso_us > 0) usleep((useconds_t)atraso_us); }
 
 #define BASE 0x80   // primeiro código de palavra
 #define MARK_CAP 0xFF   // "próxima palavra começa com maiúscula"
@@ -246,7 +276,13 @@ typedef struct {
 static void *thread_leitora(void *arg){
   Contexto *ctx = arg;
   Token t;
-  while (ler_token(ctx->in, &t, ctx->sh)) buffer_put(&ctx->buf1, &t);
+  logv("LEITORA", "iniciou");
+  while (ler_token(ctx->in, &t, ctx->sh)){
+    if (t.eh_palavra) logv("LEITORA", "leu \"%s\"", t.texto);
+    buffer_put(&ctx->buf1, &t);
+    pausa_demo();
+  }
+  logv("LEITORA", "fim do arquivo");
   buffer_close(&ctx->buf1);                 // fim do arquivo: avisa a compactadora
   return NULL;
 }
@@ -254,10 +290,14 @@ static void *thread_leitora(void *arg){
 static void *thread_compactadora(void *arg){
   Contexto *ctx = arg;
   Token t; Saida s;
+  logv("COMPACTADORA", "iniciou");
   while (buffer_get(&ctx->buf1, &t)){
     compactar_token(&t, &s, ctx->sh);
+    if (t.eh_palavra) logv("COMPACTADORA", "\"%s\" -> %d byte(s)", t.texto, s.n);
     buffer_put(&ctx->buf2, &s);
+    pausa_demo();
   }
+  logv("COMPACTADORA", "terminou");
   buffer_close(&ctx->buf2);                 // repassa o fim: avisa a gravadora
   return NULL;
 }
@@ -265,7 +305,13 @@ static void *thread_compactadora(void *arg){
 static void *thread_gravadora(void *arg){
   Contexto *ctx = arg;
   Saida s;
-  while (buffer_get(&ctx->buf2, &s)) gravar_saida(ctx->out, &s, ctx->sh);
+  logv("GRAVADORA", "iniciou");
+  while (buffer_get(&ctx->buf2, &s)){
+    gravar_saida(ctx->out, &s, ctx->sh);
+    if (s.n > 1 || s.dados[0] >= BASE) logv("GRAVADORA", "gravou %d byte(s)", s.n);
+    pausa_demo();
+  }
+  logv("GRAVADORA", "terminou");
   return NULL;
 }
 
@@ -315,6 +361,8 @@ static void decompress(FILE *in, FILE *out, Shm *sh){
       if (w){
         fputc(toupper((unsigned char)w[0]), out);
         fputs(w + 1, out);
+        logv("DESCOMPACTADOR", "restaurou \"%c%s\"", toupper((unsigned char)w[0]), w + 1);
+        pausa_demo();
         stats_add(sh, &sh->st.palavras_compactadas, 1);
         stats_add(sh, &sh->st.bytes_originais, (long)strlen(w));
       }
@@ -326,6 +374,8 @@ static void decompress(FILE *in, FILE *out, Shm *sh){
       const char *w = index_to_word(idx);
       if (w) {
         fputs(w, out);
+        logv("DESCOMPACTADOR", "restaurou \"%s\"", w);
+        pausa_demo();
         stats_add(sh, &sh->st.palavras_compactadas, 1);
         stats_add(sh, &sh->st.bytes_originais, (long)strlen(w));
       }
@@ -395,15 +445,24 @@ static int executar_monitor(Shm *sh, pid_t filho, int compactar){
 }
 
 int main(int argc, char **argv){
-  if (argc != 4){
-    fprintf(stderr, "uso: %s -c|-d entrada saida\n", argv[0]);
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  setvbuf(stdout, NULL, _IOLBF, 0);   // linha a linha, mesmo redirecionado p/ arquivo
+
+  int compactar = -1, opt;
+  while ((opt = getopt(argc, argv, "cdvs:")) != -1){
+    switch (opt){
+      case 'c': compactar = 1; break;
+      case 'd': compactar = 0; break;
+      case 'v': verbose = 1; break;
+      case 's': atraso_us = atoi(optarg) * 1000; break;   // ms -> us
+      default:  compactar = -1; optind = argc + 1; break;
+    }
+  }
+  if (compactar < 0 || argc - optind != 2){
+    fprintf(stderr, "uso: %s [-v] [-s ms] -c|-d entrada saida\n", argv[0]);
     return 1;
   }
-
-  int compactar;
-  if      (!strcmp(argv[1], "-c")) compactar = 1;
-  else if (!strcmp(argv[1], "-d")) compactar = 0;
-  else { fprintf(stderr, "modo invalido: %s\n", argv[1]); return 1; }
+  const char *entrada = argv[optind], *saida = argv[optind + 1];
 
     // 1) Memória compartilhada
   char nome[64];
@@ -424,9 +483,16 @@ int main(int argc, char **argv){
   memset(&sh->st, 0, sizeof sh->st);
 
   // 3) fork: filho = Compactador/Descompactador, pai = Monitor
+  fflush(stdout);                      // evita que o filho herde texto ainda no buffer
   pid_t pid = fork();
   if (pid < 0){ perror("fork"); munmap(sh, sizeof(Shm)); shm_unlink(nome); return 1; }
-  if (pid == 0) return executar_trabalho(compactar, argv[2], argv[3], sh);
+  if (pid == 0){
+    printf("[%s] processo filho iniciado: PID %d (pai %d)\n",
+           compactar ? "compactador" : "descompactador", (int)getpid(), (int)getppid());
+    return executar_trabalho(compactar, entrada, saida, sh);
+  }
+  printf("[monitor] processo pai: PID %d | filho %s: PID %d\n",
+         (int)getpid(), compactar ? "Compactador" : "Descompactador", (int)pid);
 
   int rc = executar_monitor(sh, pid, compactar);
 
