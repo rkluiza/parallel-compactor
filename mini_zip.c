@@ -455,7 +455,9 @@ int main(int argc, char **argv){
       case 'd': compactar = 0; break;
       case 'v': verbose = 1; break;
       case 's': atraso_us = atoi(optarg) * 1000; break;   // ms -> us
-      default:  compactar = -1; optind = argc + 1; break;
+      default:
+        fprintf(stderr, "uso: %s [-v] [-s ms] -c|-d entrada saida\n", argv[0]);
+        return 1;
     }
   }
   if (compactar < 0 || argc - optind != 2){
