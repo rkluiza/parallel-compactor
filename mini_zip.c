@@ -8,7 +8,6 @@ gcc -pthread mini_zip.c -o mz
 testar no modo detalhado:
 ./mz -v -s 5 -c entrada2.txt entrada2.mzp > log.txt
 less log.txt
-
 */
 
 #include <stdio.h>
